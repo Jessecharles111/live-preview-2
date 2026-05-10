@@ -1,10 +1,11 @@
-import { useEffect, useState, useRef } from 'react';
+import { useEffect, useRef, useState } from 'react';
 
-export default function PreviewEngine({ files, projectId }) {
+export default function PreviewEngine({ projectId }) {
   const [status, setStatus] = useState('idle');
   const [logs, setLogs] = useState([]);
   const [previewUrl, setPreviewUrl] = useState(null);
   const logEndRef = useRef(null);
+  const iframeRef = useRef(null);
 
   useEffect(() => {
     if (!projectId) return;
@@ -12,22 +13,22 @@ export default function PreviewEngine({ files, projectId }) {
     setLogs([]);
     setPreviewUrl(null);
 
-    // Start the build
+    // Trigger build
     fetch(`/api/projects/${projectId}/build`)
-      .then(res => res.json())
+      .then(r => r.json())
       .then(data => {
         if (data.status === 'ready') {
-          setPreviewUrl(data.url);
+          setPreviewUrl(`/preview/${projectId}`);
           setStatus('ready');
         } else {
-          // Poll for logs every 500ms
+          // Poll logs every 1.5s
           const poll = setInterval(() => {
             fetch(`/api/projects/${projectId}/logs`)
               .then(r => r.json())
               .then(build => {
                 setLogs(build.logs);
                 if (build.status === 'ready') {
-                  setPreviewUrl(build.url || `/preview/${projectId}`);
+                  setPreviewUrl(`/preview/${projectId}`);
                   setStatus('ready');
                   clearInterval(poll);
                 } else if (build.status === 'error') {
@@ -35,7 +36,7 @@ export default function PreviewEngine({ files, projectId }) {
                   clearInterval(poll);
                 }
               });
-          }, 500);
+          }, 1500);
           return () => clearInterval(poll);
         }
       })
@@ -43,38 +44,66 @@ export default function PreviewEngine({ files, projectId }) {
         setStatus('error');
         setLogs([`Connection error: ${err.message}`]);
       });
-  }, [projectId, files]);
+  }, [projectId]);
 
-  // Auto‑scroll logs
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [logs]);
 
   return (
     <div className="preview-layout">
+      {/* Terminal panel */}
       <div className="terminal-panel">
-        <div className="status-bar">
-          Status: <strong>{status === 'building' ? '⚙️ Building...' : status === 'ready' ? '✅ Ready' : '❌ Error'}</strong>
+        <div className="terminal-header">
+          <span className="terminal-dot" style={{background:'#ff5f57'}}></span>
+          <span className="terminal-dot" style={{background:'#febc2e'}}></span>
+          <span className="terminal-dot" style={{background:'#28c840'}}></span>
+          <span className="terminal-title">Build Logs</span>
         </div>
-        <div className="log-output">
-          {logs.length === 0 && status === 'building' && <p>Starting build...</p>}
+        <div className="terminal-body">
+          {logs.length === 0 && status === 'building' && (
+            <div className="loading-animation">
+              <div className="bouncing-loader">
+                <div></div><div></div><div></div>
+              </div>
+              <p>Initializing build environment...</p>
+            </div>
+          )}
           {logs.map((line, i) => (
-            <div key={i} className="log-line">{line}</div>
+            <div key={i} className="log-line">
+              <span className="log-prompt">$</span> {line}
+            </div>
           ))}
           <div ref={logEndRef} />
         </div>
       </div>
+
+      {/* Preview panel */}
       <div className="preview-panel">
+        <div className="preview-header">
+          Status:{' '}
+          <strong className={
+            status === 'ready' ? 'status-ready' :
+            status === 'building' ? 'status-building' : 'status-error'
+          }>
+            {status === 'ready' ? '✅ Live' : status === 'building' ? '⚙️ Building...' : '❌ Error'}
+          </strong>
+        </div>
         {previewUrl ? (
           <iframe
+            ref={iframeRef}
             src={previewUrl}
             sandbox="allow-scripts allow-same-origin"
             title="live preview"
             className="preview-iframe"
           />
         ) : (
-          <div className="loading-placeholder">
-            {status === 'building' ? 'Building project...' : 'Waiting for preview...'}
+          <div className="preview-placeholder">
+            {status === 'building' ? (
+              <div className="pulse-ring"></div>
+            ) : status === 'error' ? (
+              <p>Build failed. Check logs.</p>
+            ) : null}
           </div>
         )}
       </div>
