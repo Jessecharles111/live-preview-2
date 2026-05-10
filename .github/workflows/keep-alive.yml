@@ -1,0 +1,11 @@
+name: Keep API Alive
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Preview Engine
+        run: curl -sS -o /dev/null -w "%{http_code}" https://live-preview-glv7.onrender.com/
