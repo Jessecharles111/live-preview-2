@@ -11,7 +11,7 @@ app.use(express.json({ limit: '5mb' }));
 
 // ─── In‑memory stores ───
 const projects = new Map();
-const builds = new Map();
+const builds = new Map();   // id → { status, logs, previewUrl, outputDir }
 
 // COOP/COEP headers
 app.use((req, res, next) => {
@@ -31,20 +31,18 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Helper: run build for a project ───
+// ─── Build a project (will be called by API or preview route) ───
 function startBuild(id) {
   const project = projects.get(id);
   if (!project) return;
 
-  // Prevent duplicate builds
   if (builds.has(id) && builds.get(id).status === 'building') return;
 
-  builds.set(id, { status: 'building', logs: [], previewUrl: null });
+  builds.set(id, { status: 'building', logs: [], previewUrl: null, outputDir: null });
 
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Write project files
   Object.entries(project.files).forEach(([filePath, content]) => {
     const fullPath = path.join(tmpDir, filePath);
     fs.mkdirSync(path.dirname(fullPath), { recursive: true });
@@ -56,9 +54,7 @@ function startBuild(id) {
     if (b) b.logs.push(line);
   };
 
-  // Force development environment for npm install
   const env = { ...process.env, NODE_ENV: 'development' };
-
   const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
   install.stdout.on('data', (data) => log(data.toString()));
   install.stderr.on('data', (data) => log(data.toString()));
@@ -77,9 +73,9 @@ function startBuild(id) {
       else if (pkg.scripts?.dev) buildCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0'];
       else buildCmd = ['npx', 'vite', 'build'];
     } else {
-      // No package.json – just serve files directly
-      app.use(`/preview/${id}`, express.static(tmpDir));
-      builds.set(id, { status: 'ready', logs: [...builds.get(id).logs, 'No build needed'], previewUrl: `/preview/${id}` });
+      // No package.json – serve files directly from the project root
+      const outDir = tmpDir;
+      builds.set(id, { status: 'ready', logs: [...builds.get(id).logs, 'No build needed'], previewUrl: `/preview/${id}`, outputDir: outDir });
       return;
     }
 
@@ -92,22 +88,18 @@ function startBuild(id) {
         builds.set(id, { ...builds.get(id), status: 'error', logs: [...builds.get(id).logs, 'Build failed'] });
         return;
       }
-      const outputDir = fs.existsSync(path.join(tmpDir, 'dist')) ? 'dist' :
-                         fs.existsSync(path.join(tmpDir, 'build')) ? 'build' : '.';
-      app.use(`/preview/${id}`, express.static(path.join(tmpDir, outputDir)));
-      builds.set(id, { status: 'ready', logs: [...builds.get(id).logs, 'Build complete'], previewUrl: `/preview/${id}` });
+      const outputDir = fs.existsSync(path.join(tmpDir, 'dist')) ? path.join(tmpDir, 'dist') :
+                         fs.existsSync(path.join(tmpDir, 'build')) ? path.join(tmpDir, 'build') : tmpDir;
+      builds.set(id, { status: 'ready', logs: [...builds.get(id).logs, 'Build complete'], previewUrl: `/preview/${id}`, outputDir });
     });
   });
 }
 
-// ─── API: explicit build trigger ───
+// ─── API: trigger build explicitly ───
 app.get('/api/projects/:id/build', (req, res) => {
-  if (!projects.has(req.params.id)) {
-    return res.status(404).json({ error: 'Project not found' });
-  }
-  if (builds.has(req.params.id) && builds.get(req.params.id).status === 'ready') {
-    return res.json({ url: `/preview/${req.params.id}`, status: 'ready' });
-  }
+  if (!projects.has(req.params.id)) return res.status(404).json({ error: 'Project not found' });
+  const b = builds.get(req.params.id);
+  if (b && b.status === 'ready') return res.json({ url: `/preview/${req.params.id}`, status: 'ready' });
   startBuild(req.params.id);
   res.json({ url: `/preview/${req.params.id}`, status: 'building' });
 });
@@ -119,20 +111,26 @@ app.get('/api/projects/:id/logs', (req, res) => {
   res.json({ logs: build.logs, status: build.status, url: build.previewUrl });
 });
 
-// ─── Lazy build on preview access ───
+// ─── PREVIEW SERVING (THE FIX) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
-  if (!builds.has(id) || (builds.get(id).status !== 'ready' && builds.get(id).status !== 'building')) {
-    // Trigger build if project exists but hasn't been built
-    if (projects.has(id)) {
+  const build = builds.get(id);
+  if (build && build.status === 'ready' && build.outputDir) {
+    // Serve the static files directly from the build output directory
+    express.static(build.outputDir)(req, res, next);
+  } else if (projects.has(id)) {
+    // Build hasn't finished yet – start it if not already building
+    if (!build || build.status !== 'building') {
       startBuild(id);
     }
+    res.status(202).send('Build in progress, refresh in a moment…');
+  } else {
+    // Unknown project – fall through to dashboard
+    next();
   }
-  next();
 });
 
-// ─── Serve static previews (already mounted by startBuild) ───
-// Also serve the main client
+// ─── Dashboard static files (the React app) ───
 const clientDist = path.join(__dirname, 'client', 'dist');
 app.use(express.static(clientDist));
 app.get('*', (req, res) => {
