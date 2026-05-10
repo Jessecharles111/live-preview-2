@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: preview-engine
+    env: node
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_VERSION
+        value: 18
+    plan: free
