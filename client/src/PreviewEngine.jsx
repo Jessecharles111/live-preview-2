@@ -1,79 +1,72 @@
-import { useEffect, useRef, useState } from 'react';
-import { NanoVM } from 'nanovm';
+import { useEffect, useState, useRef } from 'react';
 
-export default function PreviewEngine({ files }) {
-  const iframeRef = useRef(null);
-  const termContainerRef = useRef(null);
-  const [status, setStatus] = useState('booting');
+export default function PreviewEngine({ files, projectId }) {
+  const [status, setStatus] = useState('idle');
+  const [logs, setLogs] = useState([]);
   const [previewUrl, setPreviewUrl] = useState(null);
-  const vmRef = useRef(null);
+  const logEndRef = useRef(null);
 
   useEffect(() => {
-    let cancelled = false;
-    const vm = new NanoVM({
-      terminal: true,
-      iframe: true,
-      term: { container: termContainerRef.current },
-    });
-    vmRef.current = vm;
+    if (!projectId) return;
+    setStatus('building');
+    setLogs([]);
+    setPreviewUrl(null);
 
-    (async () => {
-      try {
-        // 1. Boot Linux + Node.js
-        setStatus('booting');
-        await vm.boot();
-        if (cancelled) return;
-
-        // 2. Write project files to virtual FS
-        setStatus('writing files');
-        for (const [filePath, content] of Object.entries(files)) {
-          await vm.fs.writeFile(filePath, content);
+    // Start the build
+    fetch(`/api/projects/${projectId}/build`)
+      .then(res => res.json())
+      .then(data => {
+        if (data.status === 'ready') {
+          setPreviewUrl(data.url);
+          setStatus('ready');
+        } else {
+          // Poll for logs every 500ms
+          const poll = setInterval(() => {
+            fetch(`/api/projects/${projectId}/logs`)
+              .then(r => r.json())
+              .then(build => {
+                setLogs(build.logs);
+                if (build.status === 'ready') {
+                  setPreviewUrl(build.url || `/preview/${projectId}`);
+                  setStatus('ready');
+                  clearInterval(poll);
+                } else if (build.status === 'error') {
+                  setStatus('error');
+                  clearInterval(poll);
+                }
+              });
+          }, 500);
+          return () => clearInterval(poll);
         }
+      })
+      .catch(err => {
+        setStatus('error');
+        setLogs([`Connection error: ${err.message}`]);
+      });
+  }, [projectId, files]);
 
-        // 3. Install npm dependencies
-        setStatus('installing dependencies');
-        await vm.runCommand('npm install');
-
-        // 4. Start dev server (detect type)
-        setStatus('starting dev server');
-        const pkgJson = files['package.json'];
-        const hasVite = pkgJson && pkgJson.includes('"vite"');
-        const startCmd = hasVite ? 'npm run dev' : 'npx serve .';
-        vm.runCommand(startCmd);
-
-        // 5. Wait for HTTP server readiness and capture the URL
-        vm.on('http-up', (url) => {
-          if (!cancelled) {
-            setPreviewUrl(url);
-            setStatus('running');
-          }
-        });
-
-        // Also listen for errors
-        vm.on('error', (err) => {
-          if (!cancelled) setStatus('error: ' + err.message);
-        });
-      } catch (err) {
-        if (!cancelled) setStatus('fatal: ' + err.message);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      vm?.destroy();
-    };
-  }, [files]);
+  // Auto‑scroll logs
+  useEffect(() => {
+    logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [logs]);
 
   return (
     <div className="preview-layout">
-      <div className="terminal-panel" ref={termContainerRef} />
-      <div className="preview-panel">
+      <div className="terminal-panel">
         <div className="status-bar">
-          Status: <strong>{status}</strong>
+          Status: <strong>{status === 'building' ? '⚙️ Building...' : status === 'ready' ? '✅ Ready' : '❌ Error'}</strong>
         </div>
+        <div className="log-output">
+          {logs.length === 0 && status === 'building' && <p>Starting build...</p>}
+          {logs.map((line, i) => (
+            <div key={i} className="log-line">{line}</div>
+          ))}
+          <div ref={logEndRef} />
+        </div>
+      </div>
+      <div className="preview-panel">
         {previewUrl ? (
           <iframe
-            ref={iframeRef}
             src={previewUrl}
             sandbox="allow-scripts allow-same-origin"
             title="live preview"
@@ -81,7 +74,7 @@ export default function PreviewEngine({ files }) {
           />
         ) : (
           <div className="loading-placeholder">
-            {status === 'running' ? 'Waiting for server...' : 'Preparing environment...'}
+            {status === 'building' ? 'Building project...' : 'Waiting for preview...'}
           </div>
         )}
       </div>

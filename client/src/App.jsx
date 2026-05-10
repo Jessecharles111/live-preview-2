@@ -3,10 +3,9 @@ import PreviewEngine from './PreviewEngine';
 
 export default function App() {
   const [projectId, setProjectId] = useState('');
-  const [loading, setLoading] = useState(false);
   const [error, setError] = useState(null);
-  const [files, setFiles] = useState(null);
   const [ready, setReady] = useState(false);
+  const [loading, setLoading] = useState(false);
 
   const loadProject = async () => {
     if (!projectId.trim()) return;
@@ -15,8 +14,6 @@ export default function App() {
     try {
       const res = await fetch(`/api/projects/${projectId}`);
       if (!res.ok) throw new Error('Project not found');
-      const data = await res.json();
-      setFiles(data.files);
       setReady(true);
     } catch (err) {
       setError(err.message);
@@ -40,7 +37,7 @@ export default function App() {
         </button>
       </div>
       {error && <p className="error">{error}</p>}
-      {ready && files && <PreviewEngine files={files} />}
+      {ready && <PreviewEngine projectId={projectId} files={{}} />}
     </div>
   );
 }
