@@ -10,13 +10,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared pnpm store for blazing speed ───
+// ─── Shared pnpm store (speed after first run) ───
 const PNPM_STORE = path.join(__dirname, 'pnpm-store');
 fs.mkdirSync(PNPM_STORE, { recursive: true });
 
 // ─── State ───
-const projects = new Map();   // id → { files }
-const sessions = new Map();   // id → { status, logs, port, process, lastUsed }
+const projects = new Map();
+const sessions = new Map();
 
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -34,26 +34,24 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Launch dev server with base injection & real‑time logs ───
+// ─── Launch dev server ───
 function startDevServer(id) {
   const project = projects.get(id);
   if (!project) return;
-  const session = sessions.get(id);
-  if (session && session.status === 'running') return;
+  const existing = sessions.get(id);
+  if (existing && existing.status === 'running') return;
 
-  const newSession = { status: 'starting', logs: [], port: null, process: null, lastUsed: Date.now() };
-  sessions.set(id, newSession);
+  const session = { status: 'starting', logs: [], port: null, process: null, lastUsed: Date.now() };
+  sessions.set(id, session);
 
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Patch vite.config.js
+  // Patch vite.config.js with correct base
   const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
   if (viteKey) {
     let config = project.files[viteKey];
-    // base: '/preview/ID/'
     config = config.replace(/(defineConfig\(\s*\{)/, `$1\n  base: '/preview/${id}/',`);
-    // server block with allowedHosts and host
     if (!config.includes('allowedHosts')) {
       if (config.includes('server:')) config = config.replace(/server\s*:\s*\{/, 'server: { allowedHosts: true, host: "0.0.0.0",');
       else config = config.replace(/(defineConfig\(\s*\{)/, '$1\n  server: { allowedHosts: true, host: "0.0.0.0" },');
@@ -61,7 +59,6 @@ function startDevServer(id) {
     project.files[viteKey] = config;
   }
 
-  // Write files
   Object.entries(project.files).forEach(([f, c]) => {
     const fp = path.join(tmpDir, f);
     fs.mkdirSync(path.dirname(fp), { recursive: true });
@@ -72,55 +69,62 @@ function startDevServer(id) {
     const s = sessions.get(id);
     if (s) s.logs.push(line);
   };
+
   const env = { ...process.env, NODE_ENV: 'development' };
+  const isPnpm = fs.existsSync('/usr/local/bin/pnpm') || fs.existsSync('/usr/bin/pnpm');
 
-  // Use pnpm if available, else npm
-  const usePnpm = fs.existsSync('/usr/local/bin/pnpm') || fs.existsSync('/usr/bin/pnpm');
-  const cmd = usePnpm ? 'pnpm' : 'npm';
-  const args = usePnpm
-    ? ['install', '--store-dir', PNPM_STORE, '--offline']
-    : ['install', '--prefer-offline'];
+  if (isPnpm) {
+    // Use pnpm WITHOUT –offline (so it fetches on first run, then caches in store)
+    const install = spawn('pnpm', ['install', '--store-dir', PNPM_STORE, '--no-frozen-lockfile'], { cwd: tmpDir, env, shell: true });
+    install.stdout.on('data', d => log(d.toString()));
+    install.stderr.on('data', d => log(d.toString()));
+    install.on('close', code => {
+      if (code !== 0) { session.status = 'error'; log('Install failed'); return; }
+      log('Install complete – starting dev server...');
+      startDev(tmpDir, env, session, id, log);
+    });
+  } else {
+    // npm fallback (also no offline flag – first install downloads, later uses local cache)
+    const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
+    install.stdout.on('data', d => log(d.toString()));
+    install.stderr.on('data', d => log(d.toString()));
+    install.on('close', code => {
+      if (code !== 0) { session.status = 'error'; log('Install failed'); return; }
+      log('Install complete – starting dev server...');
+      startDev(tmpDir, env, session, id, log);
+    });
+  }
+}
 
-  const install = spawn(cmd, args, { cwd: tmpDir, env, shell: true });
-  install.stdout.on('data', d => log(d.toString()));
-  install.stderr.on('data', d => log(d.toString()));
+// ─── Dev server starter (common to both pnpm and npm) ───
+function startDev(tmpDir, env, session, id, log) {
+  const pkgPath = path.join(tmpDir, 'package.json');
+  let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
+  if (fs.existsSync(pkgPath)) {
+    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+    if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
+  }
+  const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: tmpDir, env, shell: true });
+  session.process = dev;
 
-  install.on('close', (code) => {
-    if (code !== 0) {
-      newSession.status = 'error';
-      log('Install failed');
-      return;
-    }
-    log('Install complete – starting dev server...');
-    const pkgPath = path.join(tmpDir, 'package.json');
-    let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
-    if (fs.existsSync(pkgPath)) {
-      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-      if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
-    }
-
-    const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: tmpDir, env, shell: true });
-    newSession.process = dev;
-
-    let portResolved = false;
-    dev.stdout.on('data', (data) => {
-      const str = data.toString();
-      log(str);
-      if (!portResolved) {
-        const match = str.match(/http:\/\/localhost:(\d+)/);
-        if (match) {
-          newSession.port = parseInt(match[1], 10);
-          portResolved = true;
-          newSession.status = 'running';
-          log(`✅ Dev server live on port ${newSession.port}`);
-        }
+  let portResolved = false;
+  dev.stdout.on('data', (data) => {
+    const str = data.toString();
+    log(str);
+    if (!portResolved) {
+      const match = str.match(/http:\/\/localhost:(\d+)/);
+      if (match) {
+        session.port = parseInt(match[1], 10);
+        portResolved = true;
+        session.status = 'running';
+        log(`✅ Dev server live on port ${session.port}`);
       }
-    });
-    dev.stderr.on('data', d => log(d.toString()));
-    dev.on('close', () => {
-      if (!portResolved) newSession.status = 'error';
-      else newSession.status = 'stopped';
-    });
+    }
+  });
+  dev.stderr.on('data', d => log(d.toString()));
+  dev.on('close', () => {
+    if (!portResolved) session.status = 'error';
+    else session.status = 'stopped';
   });
 }
 
@@ -150,7 +154,7 @@ app.get('/api/projects/:id/preview', (req, res) => {
   res.json({ url: `/preview/${id}`, status: 'starting' });
 });
 
-// ─── API: logs (for the dashboard terminal) ───
+// ─── Logs for terminal ───
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
@@ -166,7 +170,7 @@ app.use('/preview/:id', (req, res, next) => {
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: session.port,
-    path: req.url,           // keep full /preview/ID/... as Vite base
+    path: req.url,
     method: req.method,
     headers: { ...req.headers, host: `localhost:${session.port}` }
   }, (proxyRes) => {
@@ -177,11 +181,11 @@ app.use('/preview/:id', (req, res, next) => {
   req.pipe(proxyReq);
 });
 
-// ─── Loading page when dev server not yet ready ───
+// ─── Loading page ───
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (session?.status === 'running') return next(); // let proxy handle
+  if (session?.status === 'running') return next();
   if (projects.has(id)) {
     if (!session || session.status !== 'starting') startDevServer(id);
     return res.send(`<!DOCTYPE html>
