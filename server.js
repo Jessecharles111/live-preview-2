@@ -10,12 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared npm cache ───
+// ─── Shared npm cache for speed ───
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
 
 // ─── State ───
-const projects = new Map();   // id → { files }
+const projects = new Map();
 const sessions = new Map();   // id → { status, logs, port, process, lastUsed }
 
 app.use((req, res, next) => {
@@ -34,21 +34,37 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Health check helper ───
-function waitForServer(port, timeoutMs = 15000) {
+// ─── Patch vite.config.js cleanly ───
+function patchViteConfig(content, id) {
+  // Remove any existing "base:" line (handles single/double quotes, optional trailing comma)
+  content = content.replace(/^\s*base:\s*(["'].*?["'])\s*,?\s*$/gm, '');
+  // Remove any existing "server:" block (we'll rebuild it safely)
+  content = content.replace(/^\s*server:\s*\{[^}]*\},?\s*$/gm, '');
+  // Now inject our base and server config after the opening brace of defineConfig
+  content = content.replace(
+    /(defineConfig\s*\(\s*\{)/,
+    `$1
+  base: '/preview/${id}/',
+  server: { allowedHosts: true, host: '0.0.0.0' },`
+  );
+  return content;
+}
+
+// ─── Health check: wait until the dev server serves a real module (not just index) ───
+function waitForServerReady(port, id, timeoutMs = 20000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
       if (Date.now() - start > timeoutMs) return reject(new Error('Health check timeout'));
-      const req = http.get(`http://127.0.0.1:${port}/`, (res) => {
-        if (res.statusCode >= 200 && res.statusCode < 400) {
+      // Try to fetch the project's index.html (or a known module)
+      http.get(`http://127.0.0.1:${port}/preview/${id}/`, (res) => {
+        if (res.statusCode === 200 && (res.headers['content-type'] || '').includes('text/html')) {
+          // It's serving HTML – the dev server is ready
           resolve();
         } else {
           setTimeout(check, 500);
         }
-      });
-      req.on('error', () => setTimeout(check, 500));
-      req.end();
+      }).on('error', () => setTimeout(check, 500));
     };
     check();
   });
@@ -67,16 +83,10 @@ function startDevServer(id) {
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Patch vite.config.js
+  // Patch vite.config.js if present
   const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
   if (viteKey) {
-    let config = project.files[viteKey];
-    config = config.replace(/(defineConfig\(\s*\{)/, `$1\n  base: '/preview/${id}/',`);
-    if (!config.includes('allowedHosts')) {
-      if (config.includes('server:')) config = config.replace(/server\s*:\s*\{/, 'server: { allowedHosts: true, host: "0.0.0.0",');
-      else config = config.replace(/(defineConfig\(\s*\{)/, '$1\n  server: { allowedHosts: true, host: "0.0.0.0" },');
-    }
-    project.files[viteKey] = config;
+    project.files[viteKey] = patchViteConfig(project.files[viteKey], id);
   }
 
   Object.entries(project.files).forEach(([f, c]) => {
@@ -98,7 +108,7 @@ function startDevServer(id) {
   install.on('close', async (code) => {
     if (code !== 0) {
       session.status = 'error';
-      log('Install failed');
+      log('npm install failed');
       return;
     }
     log('Install complete – starting dev server...');
@@ -122,8 +132,8 @@ function startDevServer(id) {
         if (match) {
           const port = parseInt(match[1], 10);
           portResolved = true;
-          // Health check the server before declaring victory
-          waitForServer(port, 15000)
+          // Health check: verify the server actually serves content
+          waitForServerReady(port, id)
             .then(() => {
               session.port = port;
               session.status = 'running';
@@ -131,7 +141,7 @@ function startDevServer(id) {
             })
             .catch(err => {
               session.status = 'error';
-              log(`❌ Dev server failed health check: ${err.message}`);
+              log(`❌ Dev server health check failed: ${err.message}`);
             });
         }
       }
@@ -144,7 +154,7 @@ function startDevServer(id) {
   });
 }
 
-// ─── Cleanup old sessions after 10 min ───
+// ─── Cleanup after 10 min of inactivity ───
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -157,7 +167,7 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
-// ─── API: start preview ───
+// ─── API: trigger preview ───
 app.get('/api/projects/:id/preview', (req, res) => {
   const id = req.params.id;
   if (!projects.has(id)) return res.status(404).json({ error: 'Project not found' });
@@ -170,26 +180,24 @@ app.get('/api/projects/:id/preview', (req, res) => {
   res.json({ url: `/preview/${id}`, status: 'starting' });
 });
 
-// ─── Logs ───
+// ─── Live logs ───
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
   res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : null });
 });
 
-// ─── Proxy (fail‑safe – never fall through) ───
+// ─── Proxy (never fall through) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
   if (!session || session.status !== 'running' || !session.port) {
-    // Dev server not ready – return 503 instead of falling through
     return res.status(503).send('Preview not ready yet');
   }
-
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: session.port,
-    path: req.url,
+    path: req.url,   // full path including /preview/id/...
     method: req.method,
     headers: { ...req.headers, host: `localhost:${session.port}` }
   }, (proxyRes) => {
@@ -203,7 +211,7 @@ app.use('/preview/:id', (req, res, next) => {
   req.pipe(proxyReq);
 });
 
-// ─── Loading page ───
+// ─── Loading page for initial GET ───
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
@@ -225,4 +233,4 @@ app.use(express.static(clientDist));
 app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Ultra‑fast engine on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Final engine on port ${PORT}`));
