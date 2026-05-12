@@ -13,7 +13,7 @@ export default function PreviewEngine({ projectId }) {
     setLogs([]);
     setPreviewUrl(null);
 
-    // Trigger build
+    // Trigger preview (will start dev server if needed)
     fetch(`/api/projects/${projectId}/preview`)
       .then(r => r.json())
       .then(data => {
@@ -21,13 +21,13 @@ export default function PreviewEngine({ projectId }) {
           setPreviewUrl(`/preview/${projectId}`);
           setStatus('ready');
         } else {
-          // Poll logs every 1.5s
+          // Poll logs every 1.5s to see real‑time output
           const poll = setInterval(() => {
             fetch(`/api/projects/${projectId}/logs`)
               .then(r => r.json())
               .then(build => {
                 setLogs(build.logs);
-                if (build.status === 'ready') {
+                if (build.status === 'running') {
                   setPreviewUrl(`/preview/${projectId}`);
                   setStatus('ready');
                   clearInterval(poll);
@@ -66,7 +66,7 @@ export default function PreviewEngine({ projectId }) {
               <div className="bouncing-loader">
                 <div></div><div></div><div></div>
               </div>
-              <p>Initializing build environment...</p>
+              <p>Installing packages...</p>
             </div>
           )}
           {logs.map((line, i) => (
