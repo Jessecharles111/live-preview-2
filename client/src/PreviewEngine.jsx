@@ -1,9 +1,10 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useState, useRef } from 'react';
 
 export default function PreviewEngine({ projectId }) {
-  const [status, setStatus] = useState('idle');
+  const [status, setStatus] = useState('idle');     // idle | building | running | error
   const [logs, setLogs] = useState([]);
   const [previewUrl, setPreviewUrl] = useState(null);
+  const [showLogs, setShowLogs] = useState(false);
   const logEndRef = useRef(null);
   const iframeRef = useRef(null);
 
@@ -13,15 +14,13 @@ export default function PreviewEngine({ projectId }) {
     setLogs([]);
     setPreviewUrl(null);
 
-    // Trigger preview (will start dev server if needed)
     fetch(`/api/projects/${projectId}/preview`)
       .then(r => r.json())
       .then(data => {
         if (data.status === 'ready') {
           setPreviewUrl(`/preview/${projectId}`);
-          setStatus('ready');
+          setStatus('running');
         } else {
-          // Poll logs every 1.5s to see real‑time output
           const poll = setInterval(() => {
             fetch(`/api/projects/${projectId}/logs`)
               .then(r => r.json())
@@ -29,7 +28,7 @@ export default function PreviewEngine({ projectId }) {
                 setLogs(build.logs);
                 if (build.status === 'running') {
                   setPreviewUrl(`/preview/${projectId}`);
-                  setStatus('ready');
+                  setStatus('running');
                   clearInterval(poll);
                 } else if (build.status === 'error') {
                   setStatus('error');
@@ -46,64 +45,61 @@ export default function PreviewEngine({ projectId }) {
       });
   }, [projectId]);
 
+  // Auto‑scroll logs
   useEffect(() => {
     logEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [logs]);
+  }, [logs, showLogs]);
 
   return (
-    <div className="preview-layout">
-      {/* Terminal panel */}
-      <div className="terminal-panel">
-        <div className="terminal-header">
-          <span className="terminal-dot" style={{background:'#ff5f57'}}></span>
-          <span className="terminal-dot" style={{background:'#febc2e'}}></span>
-          <span className="terminal-dot" style={{background:'#28c840'}}></span>
-          <span className="terminal-title">Build Logs</span>
-        </div>
-        <div className="terminal-body">
-          {logs.length === 0 && status === 'building' && (
-            <div className="loading-animation">
-              <div className="bouncing-loader">
-                <div></div><div></div><div></div>
-              </div>
-              <p>Installing packages...</p>
-            </div>
-          )}
-          {logs.map((line, i) => (
-            <div key={i} className="log-line">
-              <span className="log-prompt">$</span> {line}
-            </div>
-          ))}
-          <div ref={logEndRef} />
-        </div>
+    <div className="preview-container">
+      {/* Status bar */}
+      <div className="preview-status">
+        <span className="status-dot" style={{
+          background: status === 'running' ? '#10b981' :
+                      status === 'building' ? '#f59e0b' : '#ef4444'
+        }}></span>
+        <span className="status-text">
+          {status === 'running' ? 'Live preview' :
+           status === 'building' ? 'Installing dependencies & starting dev server…' :
+           status === 'error' ? 'Build failed' : 'Preparing…'}
+        </span>
       </div>
 
-      {/* Preview panel */}
-      <div className="preview-panel">
-        <div className="preview-header">
-          Status:{' '}
-          <strong className={
-            status === 'ready' ? 'status-ready' :
-            status === 'building' ? 'status-building' : 'status-error'
-          }>
-            {status === 'ready' ? '✅ Live' : status === 'building' ? '⚙️ Building...' : '❌ Error'}
-          </strong>
+      {/* Preview area */}
+      {status === 'building' && !previewUrl ? (
+        <div className="loading-view">
+          <div className="spinner"></div>
+          <p className="loading-msg">Building your app…</p>
         </div>
-        {previewUrl ? (
-          <iframe
-            ref={iframeRef}
-            src={previewUrl}
-            sandbox="allow-scripts allow-same-origin"
-            title="live preview"
-            className="preview-iframe"
-          />
-        ) : (
-          <div className="preview-placeholder">
-            {status === 'building' ? (
-              <div className="pulse-ring"></div>
-            ) : status === 'error' ? (
-              <p>Build failed. Check logs.</p>
-            ) : null}
+      ) : previewUrl ? (
+        <iframe
+          ref={iframeRef}
+          src={previewUrl}
+          sandbox="allow-scripts allow-same-origin"
+          title="live preview"
+          className="preview-iframe"
+        />
+      ) : (
+        <div className="loading-view">
+          <p>Waiting for preview…</p>
+        </div>
+      )}
+
+      {/* Logs drawer (collapsible) */}
+      <div className={`logs-drawer ${showLogs ? 'open' : ''}`}>
+        <button className="logs-toggle" onClick={() => setShowLogs(!showLogs)}>
+          {showLogs ? '▼ Hide logs' : '▲ Show logs'}
+        </button>
+        {showLogs && (
+          <div className="logs-body">
+            {logs.length === 0 ? (
+              <p className="log-line empty">No activity yet…</p>
+            ) : (
+              logs.map((line, i) => (
+                <div key={i} className="log-line">{line}</div>
+              ))
+            )}
+            <div ref={logEndRef} />
           </div>
         )}
       </div>

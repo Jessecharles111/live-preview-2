@@ -23,21 +23,24 @@ export default function App() {
   };
 
   return (
-    <div className="container">
-      <h1>🚀 AI Web App Preview Engine</h1>
-      <div className="input-row">
+    <div className="app-shell">
+      <header className="app-header">
+        <h1 className="app-title">AI Web App Preview Engine</h1>
+      </header>
+      <div className="id-bar">
         <input
           type="text"
-          placeholder="Enter project ID"
+          placeholder="Paste project ID"
           value={projectId}
           onChange={(e) => setProjectId(e.target.value)}
+          className="id-input"
         />
-        <button onClick={loadProject} disabled={loading}>
-          {loading ? 'Loading...' : 'Load & Preview'}
+        <button onClick={loadProject} disabled={loading} className="id-btn">
+          {loading ? 'Loading…' : 'Preview'}
         </button>
       </div>
-      {error && <p className="error">{error}</p>}
-      {ready && <PreviewEngine projectId={projectId} files={{}} />}
+      {error && <p className="error-msg">{error}</p>}
+      {ready && <PreviewEngine projectId={projectId} />}
     </div>
   );
 }
