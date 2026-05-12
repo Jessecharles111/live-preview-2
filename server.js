@@ -10,7 +10,7 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared npm cache for speed ───
+// ─── Shared npm cache ───
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
 
@@ -34,13 +34,10 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Patch vite.config.js cleanly ───
+// ─── Patch vite.config.js ───
 function patchViteConfig(content, id) {
-  // Remove any existing "base:" line (handles single/double quotes, optional trailing comma)
   content = content.replace(/^\s*base:\s*(["'].*?["'])\s*,?\s*$/gm, '');
-  // Remove any existing "server:" block (we'll rebuild it safely)
   content = content.replace(/^\s*server:\s*\{[^}]*\},?\s*$/gm, '');
-  // Now inject our base and server config after the opening brace of defineConfig
   content = content.replace(
     /(defineConfig\s*\(\s*\{)/,
     `$1
@@ -50,16 +47,14 @@ function patchViteConfig(content, id) {
   return content;
 }
 
-// ─── Health check: wait until the dev server serves a real module (not just index) ───
+// ─── Health check ───
 function waitForServerReady(port, id, timeoutMs = 20000) {
   const start = Date.now();
   return new Promise((resolve, reject) => {
     const check = () => {
       if (Date.now() - start > timeoutMs) return reject(new Error('Health check timeout'));
-      // Try to fetch the project's index.html (or a known module)
       http.get(`http://127.0.0.1:${port}/preview/${id}/`, (res) => {
         if (res.statusCode === 200 && (res.headers['content-type'] || '').includes('text/html')) {
-          // It's serving HTML – the dev server is ready
           resolve();
         } else {
           setTimeout(check, 500);
@@ -101,6 +96,44 @@ function startDevServer(id) {
   };
   const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
 
+  // Check if package.json exists – if not, just serve static files
+  const hasPkg = fs.existsSync(path.join(tmpDir, 'package.json'));
+  if (!hasPkg) {
+    log('No package.json detected – serving static files directly');
+    // Start a static file server (npx serve) immediately
+    const srv = spawn('npx', ['serve', '.', '-l', '0'], { cwd: tmpDir, env, shell: true });
+    session.process = srv;
+
+    let portResolved = false;
+    srv.stdout.on('data', (data) => {
+      const str = data.toString();
+      log(str);
+      if (!portResolved) {
+        const match = str.match(/http:\/\/localhost:(\d+)/);
+        if (match) {
+          const port = parseInt(match[1], 10);
+          portResolved = true;
+          waitForServerReady(port, id)
+            .then(() => {
+              session.port = port;
+              session.status = 'running';
+              log(`✅ Static server healthy on port ${port}`);
+            })
+            .catch(err => {
+              session.status = 'error';
+              log(`❌ Static server failed: ${err.message}`);
+            });
+        }
+      }
+    });
+    srv.stderr.on('data', d => log(d.toString()));
+    srv.on('close', () => {
+      if (!portResolved || session.status !== 'running') session.status = 'error';
+    });
+    return;
+  }
+
+  // Normal npm install flow
   const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
@@ -132,7 +165,6 @@ function startDevServer(id) {
         if (match) {
           const port = parseInt(match[1], 10);
           portResolved = true;
-          // Health check: verify the server actually serves content
           waitForServerReady(port, id)
             .then(() => {
               session.port = port;
@@ -154,7 +186,7 @@ function startDevServer(id) {
   });
 }
 
-// ─── Cleanup after 10 min of inactivity ───
+// ─── Cleanup after 10 min ───
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -167,7 +199,7 @@ setInterval(() => {
   });
 }, 5 * 60 * 1000);
 
-// ─── API: trigger preview ───
+// ─── API: start preview ───
 app.get('/api/projects/:id/preview', (req, res) => {
   const id = req.params.id;
   if (!projects.has(id)) return res.status(404).json({ error: 'Project not found' });
@@ -180,14 +212,14 @@ app.get('/api/projects/:id/preview', (req, res) => {
   res.json({ url: `/preview/${id}`, status: 'starting' });
 });
 
-// ─── Live logs ───
+// ─── Logs ───
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
   res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : null });
 });
 
-// ─── Proxy (never fall through) ───
+// ─── Proxy ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
@@ -197,32 +229,29 @@ app.use('/preview/:id', (req, res, next) => {
   const proxyReq = http.request({
     hostname: '127.0.0.1',
     port: session.port,
-    path: req.url,   // full path including /preview/id/...
+    path: req.url,
     method: req.method,
     headers: { ...req.headers, host: `localhost:${session.port}` }
   }, (proxyRes) => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   });
-  proxyReq.on('error', (err) => {
-    console.error(`Proxy error for ${id}:`, err.message);
-    res.status(502).send('Preview server unreachable');
-  });
+  proxyReq.on('error', () => res.status(502).send('Preview server unreachable'));
   req.pipe(proxyReq);
 });
 
-// ─── Loading page for initial GET ───
+// ─── Loading page ───
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (session?.status === 'running') return next(); // let proxy handle
+  if (session?.status === 'running') return next();
   if (projects.has(id)) {
     if (!session || session.status !== 'starting') startDevServer(id);
     return res.send(`<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><title>Loading...</title>
-<style>body{margin:0;background:#0d0d0d;color:#e0e0e0;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}.spinner{width:60px;height:60px;border:6px solid #333;border-top:6px solid #3b82f6;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:20px}@keyframes spin{to{transform:rotate(360deg)}}h2{margin-bottom:5px}p{color:#aaa}</style>
+<style>body{margin:0;background:#ffffff;color:#111;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh;flex-direction:column}.spinner{width:48px;height:48px;border:5px solid #e5e7eb;border-top:5px solid #3b82f6;border-radius:50%;animation:spin 0.8s linear infinite;margin-bottom:16px}@keyframes spin{to{transform:rotate(360deg)}}h2{margin-bottom:8px;font-weight:600}p{color:#6b7280}</style>
 <script>const id='${id}';setInterval(async()=>{try{const r=await fetch('/api/projects/'+id+'/logs');const d=await r.json();if(d.status==='running')window.location.reload()}catch(e){}},1500)</script>
-</head><body><div class="spinner"></div><h2>🚀 Starting preview...</h2><p>Installing dependencies, booting dev server…</p></body></html>`);
+</head><body><div class="spinner"></div><h2>Setting up your preview…</h2><p>This will only take a few seconds</p></body></html>`);
   }
   next();
 });
@@ -233,4 +262,4 @@ app.use(express.static(clientDist));
 app.get('*', (req, res) => res.sendFile(path.join(clientDist, 'index.html')));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Final engine on port ${PORT}`));
+app.listen(PORT, () => console.log('🚀 Engine running on port ' + PORT));
