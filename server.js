@@ -10,13 +10,13 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared pnpm store (speed after first run) ───
-const PNPM_STORE = path.join(__dirname, 'pnpm-store');
-fs.mkdirSync(PNPM_STORE, { recursive: true });
+// ─── Shared npm cache to speed up installs ───
+const NPM_CACHE = path.join(__dirname, 'npm-cache');
+fs.mkdirSync(NPM_CACHE, { recursive: true });
 
 // ─── State ───
 const projects = new Map();
-const sessions = new Map();
+const sessions = new Map();   // id → { status, logs, port, process, lastUsed }
 
 app.use((req, res, next) => {
   res.setHeader('Cross-Origin-Opener-Policy', 'same-origin');
@@ -34,7 +34,7 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Launch dev server ───
+// ─── Launch dev server (npm only, cached) ───
 function startDevServer(id) {
   const project = projects.get(id);
   if (!project) return;
@@ -47,7 +47,7 @@ function startDevServer(id) {
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Patch vite.config.js with correct base
+  // Patch vite.config.js with base and allowedHosts
   const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
   if (viteKey) {
     let config = project.files[viteKey];
@@ -69,66 +69,53 @@ function startDevServer(id) {
     const s = sessions.get(id);
     if (s) s.logs.push(line);
   };
+  const env = { ...process.env, NODE_ENV: 'development', npm_config_cache: NPM_CACHE };
 
-  const env = { ...process.env, NODE_ENV: 'development' };
-  const isPnpm = fs.existsSync('/usr/local/bin/pnpm') || fs.existsSync('/usr/bin/pnpm');
+  const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
+  install.stdout.on('data', d => log(d.toString()));
+  install.stderr.on('data', d => log(d.toString()));
 
-  if (isPnpm) {
-    // Use pnpm WITHOUT –offline (so it fetches on first run, then caches in store)
-    const install = spawn('pnpm', ['install', '--store-dir', PNPM_STORE, '--no-frozen-lockfile'], { cwd: tmpDir, env, shell: true });
-    install.stdout.on('data', d => log(d.toString()));
-    install.stderr.on('data', d => log(d.toString()));
-    install.on('close', code => {
-      if (code !== 0) { session.status = 'error'; log('Install failed'); return; }
-      log('Install complete – starting dev server...');
-      startDev(tmpDir, env, session, id, log);
-    });
-  } else {
-    // npm fallback (also no offline flag – first install downloads, later uses local cache)
-    const install = spawn('npm', ['install'], { cwd: tmpDir, env, shell: true });
-    install.stdout.on('data', d => log(d.toString()));
-    install.stderr.on('data', d => log(d.toString()));
-    install.on('close', code => {
-      if (code !== 0) { session.status = 'error'; log('Install failed'); return; }
-      log('Install complete – starting dev server...');
-      startDev(tmpDir, env, session, id, log);
-    });
-  }
-}
-
-// ─── Dev server starter (common to both pnpm and npm) ───
-function startDev(tmpDir, env, session, id, log) {
-  const pkgPath = path.join(tmpDir, 'package.json');
-  let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
-  if (fs.existsSync(pkgPath)) {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
-    if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
-  }
-  const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: tmpDir, env, shell: true });
-  session.process = dev;
-
-  let portResolved = false;
-  dev.stdout.on('data', (data) => {
-    const str = data.toString();
-    log(str);
-    if (!portResolved) {
-      const match = str.match(/http:\/\/localhost:(\d+)/);
-      if (match) {
-        session.port = parseInt(match[1], 10);
-        portResolved = true;
-        session.status = 'running';
-        log(`✅ Dev server live on port ${session.port}`);
-      }
+  install.on('close', (code) => {
+    if (code !== 0) {
+      session.status = 'error';
+      log('Install failed');
+      return;
     }
-  });
-  dev.stderr.on('data', d => log(d.toString()));
-  dev.on('close', () => {
-    if (!portResolved) session.status = 'error';
-    else session.status = 'stopped';
+    log('Install complete – starting dev server...');
+
+    const pkgPath = path.join(tmpDir, 'package.json');
+    let startCmd = ['npm', 'run', 'dev', '--', '--host', '0.0.0.0', '--port', '0'];
+    if (fs.existsSync(pkgPath)) {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+      if (!pkg.scripts?.dev) startCmd = ['npx', 'serve', '.', '-l', '0'];
+    }
+
+    const dev = spawn(startCmd[0], startCmd.slice(1), { cwd: tmpDir, env, shell: true });
+    session.process = dev;
+
+    let portResolved = false;
+    dev.stdout.on('data', (data) => {
+      const str = data.toString();
+      log(str);
+      if (!portResolved) {
+        const match = str.match(/http:\/\/localhost:(\d+)/);
+        if (match) {
+          session.port = parseInt(match[1], 10);
+          portResolved = true;
+          session.status = 'running';
+          log(`✅ Dev server live on port ${session.port}`);
+        }
+      }
+    });
+    dev.stderr.on('data', d => log(d.toString()));
+    dev.on('close', () => {
+      if (!portResolved) session.status = 'error';
+      else session.status = 'stopped';
+    });
   });
 }
 
-// ─── Cleanup old sessions after 10 min ───
+// Cleanup old sessions after 10 min
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -154,14 +141,14 @@ app.get('/api/projects/:id/preview', (req, res) => {
   res.json({ url: `/preview/${id}`, status: 'starting' });
 });
 
-// ─── Logs for terminal ───
+// ─── Logs ───
 app.get('/api/projects/:id/logs', (req, res) => {
   const s = sessions.get(req.params.id);
   if (!s) return res.json({ logs: [], status: 'idle' });
   res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : null });
 });
 
-// ─── Proxy /preview/:id/* to dev server ───
+// ─── Proxy /preview/:id/* → dev server ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
