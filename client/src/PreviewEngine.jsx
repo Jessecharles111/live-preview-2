@@ -14,7 +14,7 @@ export default function PreviewEngine({ projectId }) {
     setPreviewUrl(null);
 
     // Trigger build
-    fetch(`/api/projects/${projectId}/build`)
+    fetch(`/api/projects/${projectId}/preview`)
       .then(r => r.json())
       .then(data => {
         if (data.status === 'ready') {
