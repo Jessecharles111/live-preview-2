@@ -10,12 +10,12 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '5mb' }));
 
-// ─── Shared npm cache to speed up installs ───
+// ─── Shared npm cache ───
 const NPM_CACHE = path.join(__dirname, 'npm-cache');
 fs.mkdirSync(NPM_CACHE, { recursive: true });
 
 // ─── State ───
-const projects = new Map();
+const projects = new Map();   // id → { files }
 const sessions = new Map();   // id → { status, logs, port, process, lastUsed }
 
 app.use((req, res, next) => {
@@ -34,7 +34,27 @@ app.post('/api/projects', (req, res) => {
   res.json({ id });
 });
 
-// ─── Launch dev server (npm only, cached) ───
+// ─── Health check helper ───
+function waitForServer(port, timeoutMs = 15000) {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const check = () => {
+      if (Date.now() - start > timeoutMs) return reject(new Error('Health check timeout'));
+      const req = http.get(`http://127.0.0.1:${port}/`, (res) => {
+        if (res.statusCode >= 200 && res.statusCode < 400) {
+          resolve();
+        } else {
+          setTimeout(check, 500);
+        }
+      });
+      req.on('error', () => setTimeout(check, 500));
+      req.end();
+    };
+    check();
+  });
+}
+
+// ─── Launch dev server ───
 function startDevServer(id) {
   const project = projects.get(id);
   if (!project) return;
@@ -47,7 +67,7 @@ function startDevServer(id) {
   const tmpDir = path.join(__dirname, 'builds', id);
   fs.mkdirSync(tmpDir, { recursive: true });
 
-  // Patch vite.config.js with base and allowedHosts
+  // Patch vite.config.js
   const viteKey = Object.keys(project.files).find(f => f === 'vite.config.js' || f === 'vite.config.ts');
   if (viteKey) {
     let config = project.files[viteKey];
@@ -75,7 +95,7 @@ function startDevServer(id) {
   install.stdout.on('data', d => log(d.toString()));
   install.stderr.on('data', d => log(d.toString()));
 
-  install.on('close', (code) => {
+  install.on('close', async (code) => {
     if (code !== 0) {
       session.status = 'error';
       log('Install failed');
@@ -100,22 +120,31 @@ function startDevServer(id) {
       if (!portResolved) {
         const match = str.match(/http:\/\/localhost:(\d+)/);
         if (match) {
-          session.port = parseInt(match[1], 10);
+          const port = parseInt(match[1], 10);
           portResolved = true;
-          session.status = 'running';
-          log(`✅ Dev server live on port ${session.port}`);
+          // Health check the server before declaring victory
+          waitForServer(port, 15000)
+            .then(() => {
+              session.port = port;
+              session.status = 'running';
+              log(`✅ Dev server healthy on port ${port}`);
+            })
+            .catch(err => {
+              session.status = 'error';
+              log(`❌ Dev server failed health check: ${err.message}`);
+            });
         }
       }
     });
     dev.stderr.on('data', d => log(d.toString()));
     dev.on('close', () => {
-      if (!portResolved) session.status = 'error';
+      if (!portResolved || session.status !== 'running') session.status = 'error';
       else session.status = 'stopped';
     });
   });
 }
 
-// Cleanup old sessions after 10 min
+// ─── Cleanup old sessions after 10 min ───
 setInterval(() => {
   const now = Date.now();
   sessions.forEach((s, id) => {
@@ -148,11 +177,14 @@ app.get('/api/projects/:id/logs', (req, res) => {
   res.json({ logs: s.logs, status: s.status, url: s.port ? `/preview/${req.params.id}` : null });
 });
 
-// ─── Proxy /preview/:id/* → dev server ───
+// ─── Proxy (fail‑safe – never fall through) ───
 app.use('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (!session || session.status !== 'running' || !session.port) return next();
+  if (!session || session.status !== 'running' || !session.port) {
+    // Dev server not ready – return 503 instead of falling through
+    return res.status(503).send('Preview not ready yet');
+  }
 
   const proxyReq = http.request({
     hostname: '127.0.0.1',
@@ -164,7 +196,10 @@ app.use('/preview/:id', (req, res, next) => {
     res.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.pipe(res);
   });
-  proxyReq.on('error', () => next());
+  proxyReq.on('error', (err) => {
+    console.error(`Proxy error for ${id}:`, err.message);
+    res.status(502).send('Preview server unreachable');
+  });
   req.pipe(proxyReq);
 });
 
@@ -172,7 +207,7 @@ app.use('/preview/:id', (req, res, next) => {
 app.get('/preview/:id', (req, res, next) => {
   const id = req.params.id;
   const session = sessions.get(id);
-  if (session?.status === 'running') return next();
+  if (session?.status === 'running') return next(); // let proxy handle
   if (projects.has(id)) {
     if (!session || session.status !== 'starting') startDevServer(id);
     return res.send(`<!DOCTYPE html>
